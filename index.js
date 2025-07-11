@@ -6,7 +6,6 @@ import fs from "fs";
 import { HttpsProxyAgent } from "https-proxy-agent";
 import { SocksProxyAgent } from "socks-proxy-agent";
 import axios from "axios";
-import { v4 as uuidv4 } from "uuid";
 
 const RPC_URL = "https://testnet-rpc.xoscan.io/";
 const CONFIG_FILE = "config.json";
