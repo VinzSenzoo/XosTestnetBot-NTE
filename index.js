@@ -13,6 +13,8 @@ const WXOS_ADDRESS = "0x0AAB67cf6F2e99847b9A95DeC950B250D648c1BB";
 const USDC_ADDRESS = "0xb2C1C007421f0Eb5f4B3b3F38723C309Bb208d7d";
 const BNB_ADDRESS = "0x83DFbE02dc1B1Db11bc13a8Fc7fd011E2dBbd7c0";
 const SWAP_ROUTER_ADDRESS = "0xdc7D6b58c89A554b3FDC4B5B10De9b4DbF39FB40";
+const TOKEN_CREATION_ROUTER_ADDRESS = "0xEBB7781329f101F0FDBC90A3B6f211082863884B";
+const CONTRACT_DEPLOY_ROUTER_ADDRESS = "0x45aE5Fb74828FDf9fD708C7491dC84543ec8A87e";
 const CHAIN_ID = 1267;
 const isDebug = false;
 
@@ -68,6 +70,14 @@ const SWAP_ROUTER_ABI = [
   "function unwrapWETH9(uint256 amountMinimum, address recipient) returns (uint256)"
 ];
 
+const TOKEN_CREATION_ABI = [
+  "function createToken(string name, string symbol, uint8 decimals, uint256 totalSupply) payable returns (address)"
+];
+
+const CONTRACT_DEPLOY_ABI = [
+  "function 0x8ffc0e4b(bytes varg0) public payable returns (address)"
+];
+
 const userAgents = [
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36",
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:130.0) Gecko/20100101 Firefox/130.0",
@@ -109,12 +119,10 @@ function saveConfig() {
 
 async function makeJsonRpcCall(method, params) {
   try {
-    const id = uuidv4();
     const proxyUrl = proxies[selectedWalletIndex % proxies.length] || null;
     const agent = createAgent(proxyUrl);
     const response = await axios.post(RPC_URL, {
       jsonrpc: "2.0",
-      id,
       method,
       params
     }, {
@@ -140,7 +148,6 @@ process.on("uncaughtException", (error) => {
   addLog(`Uncaught Exception: ${error.message}\n${error.stack}`, "error");
   process.exit(1);
 });
-
 
 function getShortAddress(address) {
   return address ? address.slice(0, 6) + "..." + address.slice(-4) : "N/A";
@@ -197,7 +204,7 @@ function loadAccounts() {
     }
     accounts.forEach((account, index) => {
       if (!account.privateKey || !account.token) {
-        throw new Error(`Account at index ${index} is missing privateKey or token`);
+        throw new Error(`Account at index ${index} missing privateKey or token`);
       }
     });
     addLog(`Loaded ${accounts.length} accounts from account.json`, "success");
@@ -212,13 +219,13 @@ function loadProxies() {
     if (fs.existsSync("proxy.txt")) {
       const data = fs.readFileSync("proxy.txt", "utf8");
       proxies = data.split("\n").map(proxy => proxy.trim()).filter(proxy => proxy);
-      if (proxies.length === 0) throw new Error("No proxy found in proxy.txt");
+      if (proxies.length === 0) throw new Error("No proxies found in proxy.txt");
       addLog(`Loaded ${proxies.length} proxies from proxy.txt`, "success");
     } else {
-      addLog("No proxy.txt found, running without proxy.", "info");
+      addLog("No proxy.txt found, running without proxies.", "info");
     }
   } catch (error) {
-    addLog(`Failed to load proxy: ${error.message}`, "info");
+    addLog(`Failed to load proxies: ${error.message}`, "info");
     proxies = [];
   }
 }
@@ -263,7 +270,7 @@ function getProviderWithProxy(proxyUrl, maxRetries = 3) {
     });
     return provider;
   } catch (error) {
-    addLog(`Fallback failed: ${error.message}`, "error");
+    addLog(`Direct connection failed: ${error.message}`, "error");
     throw error;
   }
 }
@@ -287,7 +294,7 @@ async function sleep(ms) {
           clearTimeout(timeout);
           clearInterval(checkStop);
           if (!hasLoggedSleepInterrupt) {
-            addLog("Process interrupted.", "info");
+            addLog("Process stopped.", "info");
             hasLoggedSleepInterrupt = true;
           }
           resolve();
@@ -352,7 +359,7 @@ async function updateWalletData() {
 
 async function getNextNonce(provider, walletAddress) {
   if (shouldStop) {
-    addLog("Nonce fetch stopped due to stop request.", "info");
+    addLog("Nonce fetching stopped due to stop request.", "info");
     throw new Error("Process stopped");
   }
   if (!ethers.isAddress(walletAddress)) {
@@ -480,6 +487,152 @@ async function performSwap(wallet, token, direction, amount) {
   }
 }
 
+async function createToken(name, symbol, supply) {
+  const decimals = 18;
+  const creationFee = ethers.parseUnits("0.001", 18);
+  let supplyBigInt;
+
+  try {
+    const supplyNumber = Number(supply);
+    if (isNaN(supplyNumber) || supplyNumber <= 0) {
+      throw new Error("Total supply must be a positive number");
+    }
+    if (supplyNumber > 1000000000) {
+      throw new Error("Total supply too large, maximum is 1,000,000,000 tokens");
+    }
+    supplyBigInt = BigInt(supplyNumber);
+
+    const provider = getProviderWithProxy(proxies[selectedWalletIndex % proxies.length] || null);
+    const wallet = new ethers.Wallet(accounts[selectedWalletIndex].privateKey, provider);
+    const contract = new ethers.Contract(TOKEN_CREATION_ROUTER_ADDRESS, TOKEN_CREATION_ABI, wallet);
+
+    const xosBalance = await provider.getBalance(wallet.address);
+    const estimatedGasCost = await estimateTransactionCost(1200000);
+    const totalRequired = creationFee + estimatedGasCost;
+    if (xosBalance < totalRequired) {
+      throw new Error(`Insufficient XOS balance: ${ethers.formatEther(xosBalance)} < ${ethers.formatEther(totalRequired)}`);
+    }
+
+    addLog(`Creating token: name=${name}, symbol=${symbol}, decimals=${decimals}, supply=${supplyNumber} tokens (${supplyBigInt.toString()} raw)`, "info");
+
+    const nonce = await getNextNonce(provider, wallet.address);
+
+    const tx = await contract.createToken(name, symbol, decimals, supplyBigInt, {
+      value: creationFee,
+      gasLimit: 1200000,
+      nonce: nonce,
+      gasPrice: ethers.parseUnits("78.75", "gwei")
+    });
+
+    addLog(`Token creation transaction sent: ${getShortHash(tx.hash)}`, "info");
+
+    const receipt = await tx.wait();
+    if (receipt.status === 0) {
+      throw new Error(`Transaction reverted: ${JSON.stringify(receipt)}`);
+    }
+
+    addLog(`Token Created Successfully: ${name} (${symbol}) with supply ${supplyNumber}`, "success");
+    await updateWallets();
+  } catch (error) {
+    addLog(`Token Creation Failed: ${error.message}`, "error");
+    throw error;
+  }
+}
+
+async function deployContract(name, funding) {
+  try {
+    const provider = getProviderWithProxy(proxies[selectedWalletIndex % proxies.length] || null);
+    const wallet = new ethers.Wallet(accounts[selectedWalletIndex].privateKey, provider);
+
+    const fundingWei = ethers.parseUnits(funding.toString(), 18);
+
+    const xosBalance = await provider.getBalance(wallet.address);
+    const estimatedGasCost = await estimateTransactionCost(1000000);
+    const totalRequired = fundingWei + estimatedGasCost;
+    if (xosBalance < totalRequired) {
+      throw new Error(`Insufficient XOS balance: ${ethers.formatEther(xosBalance)} < ${ethers.formatEther(totalRequired)}`);
+    }
+
+    const contract = new ethers.Contract(
+      CONTRACT_DEPLOY_ROUTER_ADDRESS,
+      ["function deploymentFee() view returns (uint256)"],
+      provider
+    );
+    const deploymentFee = await contract.deploymentFee();
+    if (fundingWei < deploymentFee) {
+      throw new Error(`Insufficient funding: ${ethers.formatEther(fundingWei)} < ${ethers.formatEther(deploymentFee)}`);
+    }
+    addLog(`Deployment fee required: ${ethers.formatEther(deploymentFee)} XOS`, "info");
+
+    if (!name || name.length === 0) {
+      throw new Error("Contract name cannot be empty");
+    }
+    if (name.length > 32) {
+      throw new Error(`Contract name too long: ${name.length} characters (max 32)`);
+    }
+
+    addLog(`Deploying contract: name=${name}, funding=${funding} XOS`, "info");
+
+    const abiCoder = new ethers.AbiCoder();
+    const data = abiCoder.encode(["string"], [name]);
+    addLog(`Encoded data: ${data}`, "debug");
+
+    const nonce = await getNextNonce(provider, wallet.address);
+
+    const tx = await wallet.sendTransaction({
+      to: CONTRACT_DEPLOY_ROUTER_ADDRESS,
+      data: "0x8ffc0e4b" + data.slice(2),
+      value: fundingWei,
+      gasLimit: 1000000,
+      nonce: nonce,
+      gasPrice: ethers.parseUnits("78.75", "gwei")
+    });
+
+    addLog(`Contract deployment Transaction Sent: ${getShortHash(tx.hash)}`, "info");
+
+    const receipt = await tx.wait();
+    if (receipt.status === 0) {
+      let revertReason = "Unknown revert reason";
+      try {
+        const txResponse = await provider.getTransaction(tx.hash);
+        const code = await provider.call(
+          {
+            to: txResponse.to,
+            data: txResponse.data,
+            value: txResponse.value,
+            gasLimit: txResponse.gasLimit,
+            gasPrice: txResponse.gasPrice,
+          },
+          receipt.blockNumber
+        );
+        revertReason = ethers.utils.toUtf8String(code) || "No revert string provided";
+      } catch (error) {
+        revertReason = error.reason || error.message || "Failed to retrieve revert reason";
+      }
+      throw new Error(`Transaction reverted: ${revertReason}`);
+    }
+
+    addLog(`Contract Deployed Successfully: ${name}`, "success");
+    await updateWallets();
+  } catch (error) {
+    addLog(`Contract Deployment Failed: ${error.message}`, "error");
+    throw error;
+  }
+}
+async function handleTokenCreation(name, symbol, supply) {
+  try {
+    await createToken(name, symbol, supply);
+  } catch (error) {
+  }
+}
+
+async function handleDeployContract(name, funding) {
+  try {
+    await deployContract(name, funding);
+  } catch (error) {
+  }
+}
+
 async function performCheckIn(token, proxyUrl) {
   const userAgent = userAgents[Math.floor(Math.random() * userAgents.length)];
   const headers = {
@@ -505,7 +658,7 @@ async function performCheckIn(token, proxyUrl) {
     if (response.data.success) {
       addLog(`Check-in successful: earned ${response.data.pointsEarned} points, check-in count: ${response.data.check_in_count}`, "success");
     } else {
-      const errorMessage = response.data.error || 'No error message provided';
+      const errorMessage = response.data.error || 'No error message';
       if (errorMessage === "Already checked in today") {
         addLog(`Check-in skipped: Already checked in today`, "wait");
       } else {
@@ -598,7 +751,7 @@ async function runDailyActivity() {
           if (dailyActivityInterval) {
             clearTimeout(dailyActivityInterval);
             dailyActivityInterval = null;
-            addLog("Cleared daily activity interval.", "info");
+            addLog("Daily activity interval cleared.", "info");
           }
           activityRunning = false;
           isCycleRunning = false;
@@ -610,7 +763,7 @@ async function runDailyActivity() {
           updateStatus();
           safeRender();
         } else {
-          addLog(`Waiting for ${activeProcesses} process(es) to complete...`, "info");
+          addLog(`Waiting for ${activeProcesses} processes to complete...`, "info");
         }
       }, 1000);
     } else {
@@ -707,13 +860,13 @@ const menuBox = blessed.list({
   border: { type: "line" },
   style: { fg: "white", bg: "default", border: { fg: "red" }, selected: { bg: "magenta", fg: "black" }, item: { fg: "white" } },
   items: isCycleRunning
-    ? ["Stop Activity", "Set Manual Config", "Clear Logs", "Refresh", "Exit"]
-    : ["Start Auto Daily Activity", "Set Manual Config", "Clear Logs", "Refresh", "Exit"],
+    ? ["Stop Activity", "Manual Configuration", "Was Labs", "Clear Logs", "Refresh", "Exit"]
+    : ["Start Daily Activity", "Manual Configuration", "Was Labs", "Clear Logs", "Refresh", "Exit"],
   padding: { left: 1, top: 1 }
 });
 
 const dailyActivitySubMenu = blessed.list({
-  label: " Manual Config Options ",
+  label: " Manual Configuration Options ",
   top: "44%",
   left: 0,
   width: "40%",
@@ -740,8 +893,35 @@ const dailyActivitySubMenu = blessed.list({
   hidden: true
 });
 
+const wasLabsSubMenu = blessed.list({
+  label: " Was Labs Options ",
+  top: "44%",
+  left: 0,
+  width: "40%",
+  height: "56%",
+  keys: true,
+  vi: true,
+  mouse: true,
+  border: { type: "line" },
+  style: {
+    fg: "white",
+    bg: "default",
+    border: { fg: "green" },
+    selected: { bg: "green", fg: "black" },
+    item: { fg: "white" }
+  },
+  items: [
+    "Auto Create Token",
+    "Auto Deploy Contract",
+    "Clear Logs",
+    "Back to Main Menu"
+  ],
+  padding: { left: 1, top: 1 },
+  hidden: true
+});
+
 const configForm = blessed.form({
-  label: " Enter Config Value ",
+  label: " Enter Configuration Values ",
   top: "center",
   left: "center",
   width: "30%",
@@ -762,7 +942,7 @@ const minLabel = blessed.text({
   parent: configForm,
   top: 0,
   left: 1,
-  content: "Min Value:",
+  content: "Minimum Value:",
   style: { fg: "white" }
 });
 
@@ -770,7 +950,7 @@ const maxLabel = blessed.text({
   parent: configForm,
   top: 4,
   left: 1,
-  content: "Max Value:",
+  content: "Maximum Value:",
   style: { fg: "white" }
 });
 
@@ -827,13 +1007,257 @@ const configSubmitButton = blessed.button({
   }
 });
 
+const createTokenForm = blessed.form({
+  label: " Create Token ",
+  top: "center",
+  left: "center",
+  width: "30%",
+  height: "50%",
+  keys: true,
+  mouse: true,
+  border: { type: "line" },
+  style: {
+    fg: "white",
+    bg: "default",
+    border: { fg: "green" }
+  },
+  padding: { left: 1, top: 1 },
+  hidden: true
+});
+
+const tokenNameLabel = blessed.text({
+  parent: createTokenForm,
+  top: 0,
+  left: 1,
+  content: "Token Name:",
+  style: { fg: "white" }
+});
+
+const tokenNameInput = blessed.textbox({
+  parent: createTokenForm,
+  top: 1,
+  left: 1,
+  width: "90%",
+  height: 3,
+  inputOnFocus: true,
+  border: { type: "line" },
+  style: {
+    fg: "white",
+    bg: "default",
+    border: { fg: "white" },
+    focus: { border: { fg: "green" } }
+  }
+});
+
+const tokenSymbolLabel = blessed.text({
+  parent: createTokenForm,
+  top: 4,
+  left: 1,
+  content: "Token Symbol:",
+  style: { fg: "white" }
+});
+
+const tokenSymbolInput = blessed.textbox({
+  parent: createTokenForm,
+  top: 5,
+  left: 1,
+  width: "90%",
+  height: 3,
+  inputOnFocus: true,
+  border: { type: "line" },
+  style: {
+    fg: "white",
+    bg: "default",
+    border: { fg: "white" },
+    focus: { border: { fg: "green" } }
+  }
+});
+
+const tokenSupplyLabel = blessed.text({
+  parent: createTokenForm,
+  top: 8,
+  left: 1,
+  content: "Total Supply:",
+  style: { fg: "white" }
+});
+
+const tokenSupplyInput = blessed.textbox({
+  parent: createTokenForm,
+  top: 9,
+  left: 1,
+  width: "90%",
+  height: 3,
+  inputOnFocus: true,
+  border: { type: "line" },
+  style: {
+    fg: "white",
+    bg: "default",
+    border: { fg: "white" },
+    focus: { border: { fg: "green" } }
+  }
+});
+
+const createTokenButton = blessed.button({
+  parent: createTokenForm,
+  top: 13,
+  left: "15%",
+  width: 10,
+  height: 3,
+  content: "Create",
+  align: "center",
+  border: { type: "line" },
+  clickable: true,
+  keys: true,
+  mouse: true,
+  style: {
+    fg: "white",
+    bg: "blue",
+    border: { fg: "white" },
+    hover: { bg: "green" },
+    focus: { bg: "green", border: { fg: "yellow" } }
+  }
+});
+
+const cancelTokenButton = blessed.button({
+  parent: createTokenForm,
+  top: 13,
+  left: "50%",
+  width: 10,
+  height: 3,
+  content: "Cancel",
+  align: "center",
+  border: { type: "line" },
+  clickable: true,
+  keys: true,
+  mouse: true,
+  style: {
+    fg: "white",
+    bg: "red",
+    border: { fg: "white" },
+    hover: { bg: "darkred" },
+    focus: { bg: "darkred", border: { fg: "yellow" } }
+  }
+});
+
+const deployContractForm = blessed.form({
+  label: " Deploy Contract ",
+  top: "center",
+  left: "center",
+  width: "30%",
+  height: "50%",
+  keys: true,
+  mouse: true,
+  border: { type: "line" },
+  style: {
+    fg: "white",
+    bg: "default",
+    border: { fg: "green" }
+  },
+  padding: { left: 1, top: 1 },
+  hidden: true
+});
+
+const contractNameLabel = blessed.text({
+  parent: deployContractForm,
+  top: 0,
+  left: 1,
+  content: "Contract Name:",
+  style: { fg: "white" }
+});
+
+const contractNameInput = blessed.textbox({
+  parent: deployContractForm,
+  top: 1,
+  left: 1,
+  width: "90%",
+  height: 3,
+  inputOnFocus: true,
+  border: { type: "line" },
+  style: {
+    fg: "white",
+    bg: "default",
+    border: { fg: "white" },
+    focus: { border: { fg: "green" } }
+  }
+});
+
+const initialFundingLabel = blessed.text({
+  parent: deployContractForm,
+  top: 4,
+  left: 1,
+  content: "Initial Funding (XOS):",
+  style: { fg: "white" }
+});
+
+const initialFundingInput = blessed.textbox({
+  parent: deployContractForm,
+  top: 5,
+  left: 1,
+  width: "90%",
+  height: 3,
+  inputOnFocus: true,
+  border: { type: "line" },
+  style: {
+    fg: "white",
+    bg: "default",
+    border: { fg: "white" },
+    focus: { border: { fg: "green" } }
+  },
+  value: "0.001"
+});
+
+const deployContractButton = blessed.button({
+  parent: deployContractForm,
+  top: 9,
+  left: "15%",
+  width: 10,
+  height: 3,
+  content: "Deploy",
+  align: "center",
+  border: { type: "line" },
+  clickable: true,
+  keys: true,
+  mouse: true,
+  style: {
+    fg: "white",
+    bg: "blue",
+    border: { fg: "white" },
+    hover: { bg: "green" },
+    focus: { bg: "green", border: { fg: "yellow" } }
+  }
+});
+
+const cancelDeployButton = blessed.button({
+  parent: deployContractForm,
+  top: 9,
+  left: "50%",
+  width: 10,
+  height: 3,
+  content: "Cancel",
+  align: "center",
+  border: { type: "line" },
+  clickable: true,
+  keys: true,
+  mouse: true,
+  style: {
+    fg: "white",
+    bg: "red",
+    border: { fg: "white" },
+    hover: { bg: "darkred" },
+    focus: { bg: "darkred", border: { fg: "yellow" } }
+  }
+});
+
 screen.append(headerBox);
 screen.append(statusBox);
 screen.append(walletBox);
 screen.append(logBox);
 screen.append(menuBox);
 screen.append(dailyActivitySubMenu);
+screen.append(wasLabsSubMenu);
 screen.append(configForm);
+screen.append(createTokenForm);
+screen.append(deployContractForm);
 
 let renderQueue = [];
 let isRendering = false;
@@ -851,7 +1275,7 @@ function safeRender() {
       }
       screen.render();
     } catch (error) {
-      addLog(`UI render error: ${error.message}`, "error");
+      addLog(`UI rendering error: ${error.message}`, "error");
     }
     renderQueue.shift();
     isRendering = false;
@@ -882,8 +1306,16 @@ function adjustLayout() {
     dailyActivitySubMenu.width = menuBox.width;
     dailyActivitySubMenu.height = menuBox.height;
     dailyActivitySubMenu.left = menuBox.left;
+    wasLabsSubMenu.top = menuBox.top;
+    wasLabsSubMenu.width = menuBox.width;
+    wasLabsSubMenu.height = menuBox.height;
+    wasLabsSubMenu.left = menuBox.left;
     configForm.width = Math.floor(screenWidth * 0.3);
     configForm.height = Math.floor(screenHeight * 0.4);
+    createTokenForm.width = Math.floor(screenWidth * 0.3);
+    createTokenForm.height = Math.floor(screenHeight * 0.5);
+    deployContractForm.width = Math.floor(screenWidth * 0.3);
+    deployContractForm.height = Math.floor(screenHeight * 0.5);
   }
 
   safeRender();
@@ -942,8 +1374,8 @@ function updateMenu() {
   try {
     menuBox.setItems(
       isCycleRunning
-        ? ["Stop Activity", "Set Manual Config", "Clear Logs", "Refresh", "Exit"]
-        : ["Start Auto Daily Activity", "Set Manual Config", "Clear Logs", "Refresh", "Exit"]
+        ? ["Stop Activity", "Manual Configuration", "Was Labs", "Clear Logs", "Refresh", "Exit"]
+        : ["Start Daily Activity", "Manual Configuration", "Was Labs", "Clear Logs", "Refresh", "Exit"]
     );
     safeRender();
   } catch (error) {
@@ -972,6 +1404,7 @@ logBox.on("click", () => {
   logBox.style.border.fg = "yellow";
   menuBox.style.border.fg = "red";
   dailyActivitySubMenu.style.border.fg = "blue";
+  wasLabsSubMenu.style.border.fg = "green";
   safeRender();
 });
 
@@ -983,9 +1416,9 @@ logBox.on("blur", () => {
 menuBox.on("select", async (item) => {
   const action = item.getText();
   switch (action) {
-    case "Start Auto Daily Activity":
+    case "Start Daily Activity":
       if (isCycleRunning) {
-        addLog("Cycle is still running. Stop the current cycle first.", "error");
+        addLog("Cycle is already running. Stop the current cycle first.", "error");
       } else {
         await runDailyActivity();
       }
@@ -995,9 +1428,9 @@ menuBox.on("select", async (item) => {
       if (dailyActivityInterval) {
         clearTimeout(dailyActivityInterval);
         dailyActivityInterval = null;
-        addLog("Cleared daily activity interval.", "info");
+        addLog("Daily activity interval cleared.", "info");
       }
-      addLog("Stopping daily activity. Please wait for ongoing process to complete.", "info");
+      addLog("Stopping daily activity. Please wait for running processes to complete.", "info");
       safeRender();
       const stopCheckInterval = setInterval(() => {
         if (activeProcesses <= 0) {
@@ -1011,18 +1444,30 @@ menuBox.on("select", async (item) => {
           updateStatus();
           safeRender();
         } else {
-          addLog(`Waiting for ${activeProcesses} process(es) to complete...`, "info");
+          addLog(`Waiting for ${activeProcesses} processes to complete...`, "info");
           safeRender();
         }
       }, 1000);
       break;
-    case "Set Manual Config":
+    case "Manual Configuration":
       menuBox.hide();
       dailyActivitySubMenu.show();
       setTimeout(() => {
         if (dailyActivitySubMenu.visible) {
           screen.focusPush(dailyActivitySubMenu);
           dailyActivitySubMenu.style.border.fg = "yellow";
+          logBox.style.border.fg = "magenta";
+          safeRender();
+        }
+      }, 100);
+      break;
+    case "Was Labs":
+      menuBox.hide();
+      wasLabsSubMenu.show();
+      setTimeout(() => {
+        if (wasLabsSubMenu.visible) {
+          screen.focusPush(wasLabsSubMenu);
+          wasLabsSubMenu.style.border.fg = "yellow";
           logBox.style.border.fg = "magenta";
           safeRender();
         }
@@ -1128,6 +1573,51 @@ dailyActivitySubMenu.on("select", (item) => {
   }
 });
 
+wasLabsSubMenu.on("select", async (item) => {
+  const action = item.getText();
+  switch (action) {
+    case "Auto Create Token":
+      createTokenForm.show();
+      setTimeout(() => {
+        if (createTokenForm.visible) {
+          screen.focusPush(tokenNameInput);
+          tokenNameInput.clearValue();
+          tokenSymbolInput.clearValue();
+          tokenSupplyInput.clearValue();
+          safeRender();
+        }
+      }, 100);
+      break;
+    case "Auto Deploy Contract":
+      deployContractForm.show();
+      setTimeout(() => {
+        if (deployContractForm.visible) {
+          screen.focusPush(contractNameInput);
+          contractNameInput.clearValue();
+          initialFundingInput.setValue("0.001");
+          safeRender();
+        }
+      }, 100);
+      break;
+    case "Clear Logs":
+      clearTransactionLogs();
+      break;
+    case "Back to Main Menu":
+      wasLabsSubMenu.hide();
+      menuBox.show();
+      setTimeout(() => {
+        if (menuBox.visible) {
+          screen.focusPush(menuBox);
+          menuBox.style.border.fg = "cyan";
+          wasLabsSubMenu.style.border.fg = "green";
+          logBox.style.border.fg = "magenta";
+          safeRender();
+        }
+      }, 100);
+      break;
+  }
+});
+
 let isSubmitting = false;
 configForm.on("submit", () => {
   if (isSubmitting) return;
@@ -1140,7 +1630,7 @@ configForm.on("submit", () => {
     if (["xosSwapRange", "usdcSwapRange", "bnbSwapRange"].includes(configForm.configType)) {
       maxValue = parseFloat(configInputMax.getValue().trim());
       if (isNaN(maxValue) || maxValue <= 0) {
-        addLog("Invalid Max value. Please enter a positive number.", "error");
+        addLog("Invalid Maximum Value. Please enter a positive number.", "error");
         configInputMax.clearValue();
         screen.focusPush(configInputMax);
         safeRender();
@@ -1170,7 +1660,7 @@ configForm.on("submit", () => {
     addLog(`Swap Repetitions set to ${dailyActivityConfig.swapRepetitions}`, "success");
   } else if (configForm.configType === "xosSwapRange") {
     if (value > maxValue) {
-      addLog("Min value cannot be greater than Max value.", "error");
+      addLog("Minimum Value cannot be greater than Maximum Value.", "error");
       configInput.clearValue();
       configInputMax.clearValue();
       screen.focusPush(configInput);
@@ -1183,7 +1673,7 @@ configForm.on("submit", () => {
     addLog(`XOS Swap Range set to ${value} - ${maxValue}`, "success");
   } else if (configForm.configType === "usdcSwapRange") {
     if (value > maxValue) {
-      addLog("Min value cannot be greater than Max value.", "error");
+      addLog("Minimum Value cannot be greater than Maximum Value.", "error");
       configInput.clearValue();
       configInputMax.clearValue();
       screen.focusPush(configInput);
@@ -1196,7 +1686,7 @@ configForm.on("submit", () => {
     addLog(`USDC Swap Range set to ${value} - ${maxValue}`, "success");
   } else if (configForm.configType === "bnbSwapRange") {
     if (value > maxValue) {
-      addLog("Min value cannot be greater than Max value.", "error");
+      addLog("Minimum Value cannot be greater than Maximum Value.", "error");
       configInput.clearValue();
       configInputMax.clearValue();
       screen.focusPush(configInput);
@@ -1224,6 +1714,124 @@ configForm.on("submit", () => {
   }, 100);
 });
 
+let isCreatingToken = false;
+createTokenForm.on("submit", async () => {
+  if (isCreatingToken) return;
+  isCreatingToken = true;
+
+  const name = tokenNameInput.getValue().trim();
+  const symbol = tokenSymbolInput.getValue().trim();
+  let supply = tokenSupplyInput.getValue().trim();
+
+  try {
+    if (!name || !symbol || !supply) {
+      addLog("Semua kolom wajib diisi.", "error");
+      if (!name) screen.focusPush(tokenNameInput);
+      else if (!symbol) screen.focusPush(tokenSymbolInput);
+      else screen.focusPush(tokenSupplyInput);
+      safeRender();
+      isCreatingToken = false;
+      return;
+    }
+
+    const supplyNumber = parseFloat(supply);
+    if (isNaN(supplyNumber) || supplyNumber <= 0) {
+      addLog("Nilai total supply tidak valid. Harap masukkan angka positif.", "error");
+      tokenSupplyInput.clearValue();
+      screen.focusPush(tokenSupplyInput);
+      safeRender();
+      isCreatingToken = false;
+      return;
+    }
+    if (supplyNumber > 1000000000) {
+      addLog("Total supply terlalu besar. Maksimum adalah 1,000,000,000 token.", "error");
+      tokenSupplyInput.clearValue();
+      screen.focusPush(tokenSupplyInput);
+      safeRender();
+      isCreatingToken = false;
+      return;
+    }
+
+    createTokenForm.hide();
+    tokenNameInput.clearValue();
+    tokenSymbolInput.clearValue();
+    tokenSupplyInput.clearValue();
+    wasLabsSubMenu.show();
+    setTimeout(() => {
+      if (wasLabsSubMenu.visible) {
+        screen.focusPush(wasLabsSubMenu);
+        wasLabsSubMenu.style.border.fg = "yellow";
+        logBox.style.border.fg = "magenta";
+        safeRender();
+      }
+    }, 100);
+
+    handleTokenCreation(name, symbol, supplyNumber);
+  } catch (error) {
+    addLog(`Kesalahan validasi input token: ${error.message}`, "error");
+    isCreatingToken = false;
+  }
+});
+
+let isDeployingContract = false;
+deployContractForm.on("submit", async () => {
+  if (isDeployingContract) return;
+  isDeployingContract = true;
+
+  const name = contractNameInput.getValue().trim();
+  let funding = initialFundingInput.getValue().trim();
+
+  try {
+    if (!name || !funding) {
+      addLog("Semua kolom wajib diisi.", "error");
+      if (!name) screen.focusPush(contractNameInput);
+      else screen.focusPush(initialFundingInput);
+      safeRender();
+      isDeployingContract = false;
+      return;
+    }
+
+    const fundingNumber = parseFloat(funding);
+    if (isNaN(fundingNumber) || fundingNumber <= 0) {
+      addLog("Nilai initial funding tidak valid. Harap masukkan angka positif.", "error");
+      initialFundingInput.clearValue();
+      screen.focusPush(initialFundingInput);
+      safeRender();
+      isDeployingContract = false;
+      return;
+    }
+
+    deployContractForm.hide();
+    contractNameInput.clearValue();
+    initialFundingInput.clearValue();
+    wasLabsSubMenu.show();
+    setTimeout(() => {
+      if (wasLabsSubMenu.visible) {
+        screen.focusPush(wasLabsSubMenu);
+        wasLabsSubMenu.style.border.fg = "yellow";
+        logBox.style.border.fg = "magenta";
+        safeRender();
+      }
+    }, 100);
+
+    handleDeployContract(name, fundingNumber);
+  } catch (error) {
+    addLog(`Kesalahan validasi input deploy contract: ${error.message}`, "error");
+    isDeployingContract = false;
+  }
+});
+
+tokenSupplyInput.on("input", () => {
+  let value = tokenSupplyInput.getValue().replace(/,/g, '');
+  if (!isNaN(value) && value !== '') {
+    const numValue = parseFloat(value);
+    if (!isNaN(numValue)) {
+      tokenSupplyInput.setValue(numValue.toLocaleString('en-US'));
+      safeRender();
+    }
+  }
+});
+
 configInput.key(["enter"], () => {
   if (["xosSwapRange", "usdcSwapRange", "bnbSwapRange"].includes(configForm.configType)) {
     screen.focusPush(configInputMax);
@@ -1243,6 +1851,85 @@ configSubmitButton.on("press", () => {
 configSubmitButton.on("click", () => {
   screen.focusPush(configSubmitButton);
   configForm.submit();
+});
+
+tokenNameInput.key(["enter"], () => {
+  screen.focusPush(tokenSymbolInput);
+});
+
+tokenSymbolInput.key(["enter"], () => {
+  screen.focusPush(tokenSupplyInput);
+});
+
+tokenSupplyInput.key(["enter"], () => {
+  createTokenForm.submit();
+});
+
+createTokenButton.on("press", () => {
+  createTokenForm.submit();
+});
+
+createTokenButton.on("click", () => {
+  screen.focusPush(createTokenButton);
+  createTokenForm.submit();
+});
+
+cancelTokenButton.on("press", () => {
+  createTokenForm.hide();
+  tokenNameInput.clearValue();
+  tokenSymbolInput.clearValue();
+  tokenSupplyInput.clearValue();
+  wasLabsSubMenu.show();
+  setTimeout(() => {
+    if (wasLabsSubMenu.visible) {
+      screen.focusPush(wasLabsSubMenu);
+      wasLabsSubMenu.style.border.fg = "yellow";
+      logBox.style.border.fg = "magenta";
+      safeRender();
+    }
+  }, 100);
+});
+
+cancelTokenButton.on("click", () => {
+  screen.focusPush(cancelTokenButton);
+  cancelTokenButton.emit("press");
+});
+
+contractNameInput.key(["enter"], () => {
+  screen.focusPush(initialFundingInput);
+});
+
+initialFundingInput.key(["enter"], () => {
+  deployContractForm.submit();
+});
+
+deployContractButton.on("press", () => {
+  deployContractForm.submit();
+});
+
+deployContractButton.on("click", () => {
+  screen.focusPush(deployContractButton);
+  deployContractForm.submit();
+});
+
+cancelDeployButton.on("press", () => {
+  deployContractForm.hide();
+  contractNameInput.clearValue();
+  initialFundingInput.clearValue();
+  wasLabsSubMenu.show();
+  setTimeout(() => {
+    if (wasLabsSubMenu.visible) {
+      screen.focusPush(wasLabsSubMenu);
+      wasLabsSubMenu.style.border.fg = "yellow";
+      logBox.style.border.fg = "magenta";
+      safeRender();
+    }
+  }, 100);
+});
+
+cancelDeployButton.on("click", () => {
+  screen.focusPush(cancelDeployButton);
+  cancelDeployButton.emit("press");
 });
 
 configForm.key(["escape"], () => {
@@ -1266,6 +1953,51 @@ dailyActivitySubMenu.key(["escape"], () => {
       screen.focusPush(menuBox);
       menuBox.style.border.fg = "cyan";
       dailyActivitySubMenu.style.border.fg = "blue";
+      logBox.style.border.fg = "magenta";
+      safeRender();
+    }
+  }, 100);
+});
+
+wasLabsSubMenu.key(["escape"], () => {
+  wasLabsSubMenu.hide();
+  menuBox.show();
+  setTimeout(() => {
+    if (menuBox.visible) {
+      screen.focusPush(menuBox);
+      menuBox.style.border.fg = "cyan";
+      wasLabsSubMenu.style.border.fg = "green";
+      logBox.style.border.fg = "magenta";
+      safeRender();
+    }
+  }, 100);
+});
+
+createTokenForm.key(["escape"], () => {
+  createTokenForm.hide();
+  tokenNameInput.clearValue();
+  tokenSymbolInput.clearValue();
+  tokenSupplyInput.clearValue();
+  wasLabsSubMenu.show();
+  setTimeout(() => {
+    if (wasLabsSubMenu.visible) {
+      screen.focusPush(wasLabsSubMenu);
+      wasLabsSubMenu.style.border.fg = "yellow";
+      logBox.style.border.fg = "magenta";
+      safeRender();
+    }
+  }, 100);
+});
+
+deployContractForm.key(["escape"], () => {
+  deployContractForm.hide();
+  contractNameInput.clearValue();
+  initialFundingInput.clearValue();
+  wasLabsSubMenu.show();
+  setTimeout(() => {
+    if (wasLabsSubMenu.visible) {
+      screen.focusPush(wasLabsSubMenu);
+      wasLabsSubMenu.style.border.fg = "yellow";
       logBox.style.border.fg = "magenta";
       safeRender();
     }
